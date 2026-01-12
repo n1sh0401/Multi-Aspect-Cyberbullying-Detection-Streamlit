@@ -240,7 +240,9 @@ venues including social media, online games, and messaging apps."""
     st.image("SHAPss.png", caption="SHAP Explainability")
     
     st.markdown(
-        """In this project, SHAP is used to interpret the model’s predictions by quantifying how both textual tokens and numerical features contribute to each output. By comparing inputs against a representative background distribution, SHAP explains individual predictions and identifies the most influential features, improving transparency and trust in the deployed model."""
+        """In this project, SHAP (SHapley Additive exPlanations) is applied to improve the interpretability of the deployed machine learning model by explaining individual predictions. SHAP quantifies the contribution of both textual tokens and numerical features
+          by comparing each input against a representative background distribution derived from training-like data. This allows the model’s decisions to be decomposed into feature-level 
+          attributions, showing how specific inputs influence the final prediction. By providing both local explanations and overall feature importance, SHAP enhances model transparency, supports debugging, and increases trust in the system’s outputs."""
     )
 
 elif nav == "Dataset":
