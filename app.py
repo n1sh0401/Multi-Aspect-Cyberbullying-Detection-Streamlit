@@ -3,17 +3,100 @@ import torch
 from transformers import AutoTokenizer, AutoConfig
 from model.bert_multimodal import BertForMultiModalSequenceClassification
 
-st.set_page_config(layout="wide")
+# SHAP explainer utilities
+from explainers.shap_explainer import HuggingFaceShapExplainer
+from explainers.streamlit_helpers import run_explain_and_render
+import os
+
+# Model identifier used across the app
+MODEL_ID = "rngrye/BERT-cyberbullying-classifier-MLPLeakage"
+
+st.set_page_config(page_title="Cyberbullying Detection Platform", layout="wide")
+
+# Convert BG_Pewdipie1 image to base64 for use in CSS
+import base64
+
+def get_base64_image(image_path):
+    with open(image_path, "rb") as img_file:
+        return base64.b64encode(img_file.read()).decode()
+
+bg_image_base64 = get_base64_image("BG_Pewdipie2.jpg")
+
+# Apply a simple mostly-white / light-grey theme for a clean polished look
+st.markdown(
+    f"""
+    <style>
+    :root {{ --bg: #ffffff; --sidebar-bg: #e6e7eb; --muted: #6b7280; --text-color: #000000; }}
+
+    /* App background with BG_Feathers image */
+    [data-testid="stAppViewContainer"] {{ 
+        background-image: url('data:image/jpeg;base64,{bg_image_base64}');
+        background-attachment: fixed;
+        background-size: cover;
+        background-repeat: no-repeat;
+        color: var(--text-color);
+    }}
+    [data-testid="stAppViewContainer"]::before {{
+        content: '';
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: rgba(255, 255, 255, 0.5);
+        pointer-events: none;
+        z-index: 0;
+    }}
+    [data-testid="stAppViewContainer"] * {{ color: var(--text-color) !important; position: relative; z-index: 1; }}
+
+    /* Sidebar background and text */
+    [data-testid="stSidebar"] > div {{ background-color: var(--sidebar-bg); color: var(--text-color); }}
+    [data-testid="stSidebar"] > div * {{ color: var(--text-color) !important; }}
+
+    /* Header / top bar: set dark background but white text for contrast */
+    [data-testid="stHeader"] {{ background-color: #111827 !important; }}
+    [data-testid="stHeader"] * {{ color: #ffffff !important; }}
+    [data-testid="stHeader"] code {{ color: #ffffff !important; background-color: transparent !important; }}
+
+    /* File uploader: ensure light background and readable text */
+    [data-testid="stFileUploader"] {{ background-color: #ffffff !important; color: var(--text-color) !important; border: 1px dashed #e5e7eb; padding: 0.9rem; border-radius: 8px; box-shadow: 0 1px 2px rgba(16,24,40,0.03); }}
+    [data-testid="stFileUploader"] * {{ color: var(--text-color) !important; }}
+    [data-testid="stFileUploader"] code {{ color: var(--text-color) !important; background-color: transparent !important; }}
+
+    /* Text area: make input area white and readable */
+    [data-testid="stTextArea"] {{ background-color: #ffffff !important; padding: 0.5rem; border-radius: 8px; }}
+    [data-testid="stTextArea"] textarea {{ background-color: #ffffff !important; color: #000000 !important; }}
+
+    /* Inline code styling: light background with dark text for readability on white surfaces */
+    code {{ background-color: #f3f4f6; color: #000000; padding: 2px 6px; border-radius: 6px; }}
+
+    /* But when inside the header (dark), make code white and transparent background */
+    [data-testid="stHeader"] code {{ color: #ffffff !important; background-color: transparent !important; }}
+
+    .stButton>button {{ background-color: #ffffff; border: 1px solid #e5e7eb; color: var(--text-color); }}
+    .stTextInput>div>input, .stTextArea>div>textarea {{ border: 1px solid #e5e7eb; color: var(--text-color); }}
+    .css-1kyxreq {{ padding: 0.6rem 0.8rem; }} /* small adjustments for layout */
+
+    /* Keep links noticeable */
+    a {{ color: #0b5fff !important; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 @st.cache_resource
 def load_model():
-    model_id = "rngrye/BERT-cyberbullying-classifier-MLPLeakage"
+    # Use the global MODEL_ID constant so it can be shared with the SHAP explainer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    config = AutoConfig.from_pretrained(MODEL_ID)
+    # Ensure config matches the fine-tuned model architecture (avoid size mismatch)
+    # The model checkpoint was trained with mlp_hidden_size=32 and 3 additional features
+    config.mlp_hidden_size = getattr(config, "mlp_hidden_size", 32)
+    config.additional_features_dim = getattr(config, "additional_features_dim", 3)
 
-    config = AutoConfig.from_pretrained(model_id)
     model = BertForMultiModalSequenceClassification.from_pretrained(
-        model_id,
+        MODEL_ID,
         config=config
     )
 
@@ -23,76 +106,200 @@ def load_model():
 tokenizer, model = load_model()
 model.eval()
 
-st.title("Cyberbullying Detection App")
+# Auto-load SHAP background from training CSV (if available) so numeric SHAP works without a sidebar
+BACKGROUND_CSV = "model_augmented_complete.csv"
+if 'bg_loaded' not in st.session_state:
+    try:
+        if os.path.exists(BACKGROUND_CSV):
+            try:
+                import pandas as _pd
+                # Inspect header and map known column names to the expected ones
+                cols = [c.lower() for c in _pd.read_csv(BACKGROUND_CSV, nrows=0).columns.tolist()]
 
-# Add pandas for CSV handling
+                # Determine text column
+                text_candidates = ["text", "aggregated_message", "message", "aggregated_message_text"]
+                text_col = next((c for c in text_candidates if c in cols), None)
+
+                # Determine numeric columns mapping
+                peerness_candidates = ["peerness"]
+                aggressiveness_candidates = ["aggressiveness", "aggression_ratio", "aggressionratio"]
+                repetition_candidates = ["repetition", "avg_time_diff_seconds", "avgtimediffseconds"]
+
+                numeric_cols = []
+                # helper to find a candidate present in cols
+                def find_candidate(candidates):
+                    for cand in candidates:
+                        if cand in cols:
+                            # return the original cased column name from CSV
+                            for orig in _pd.read_csv(BACKGROUND_CSV, nrows=0).columns.tolist():
+                                if orig.lower() == cand:
+                                    return orig
+                    return None
+
+                text_col_orig = find_candidate(text_candidates)
+                peerness_col = find_candidate(peerness_candidates)
+                aggressiveness_col = find_candidate(aggressiveness_candidates)
+                repetition_col = find_candidate(repetition_candidates)
+
+                if text_col_orig is None:
+                    raise ValueError("text column not found in training CSV; expected one of: Aggregated_Message (preferred), text")
+
+                if peerness_col and aggressiveness_col and repetition_col:
+                    numeric_cols_list = [peerness_col, aggressiveness_col, repetition_col]
+                else:
+                    numeric_cols_list = None
+
+                bg_texts, bg_numeric, bg_numeric_names = HuggingFaceShapExplainer.load_background_from_csv(
+                    BACKGROUND_CSV,
+                    text_col=text_col_orig,
+                    numeric_cols=numeric_cols_list,
+                    max_rows=500,
+                )
+
+                st.session_state['bg_texts'] = bg_texts
+                st.session_state['bg_numeric'] = bg_numeric
+                st.session_state['bg_numeric_names'] = bg_numeric_names
+                st.session_state['bg_loaded'] = True
+            except Exception as e:
+                st.session_state['bg_loaded'] = False
+                st.warning(f"Could not load SHAP background from {BACKGROUND_CSV}: {e}")
+        else:
+            st.session_state['bg_loaded'] = False
+    except Exception:
+        st.session_state['bg_loaded'] = False
+
+# Add pandas for CSV handling 🔍📖🧾📲📢⚙️⚔️🔋⌨️💾💡
 import pandas as pd
+
+# Keep a placeholder for the SHAP explainer in session state (built on demand by the Explain buttons)
+if 'explainer' not in st.session_state:
+    st.session_state['explainer'] = None
+
+# Note: Sidebar uploader removed — explanations will use a small default text background when the explainer
+# is auto-built from the Explain buttons (numeric SHAP is not available without numeric background data).
+
 
 # --- Left Navigation (Sidebar) ---
 st.sidebar.title("Navigation")
-nav = st.sidebar.radio("Go to", ["Explanation", "Dataset", "Predict / Upload"])
+_nav_map = {
+    "🔎 Predict": "Predict / Upload",
+    "ℹ️ More about Cyberbullying": "Info about Cyberbullying",
+    "📑 Dataset": "Dataset",
+}
+_nav_choice = st.sidebar.radio("Go to", list(_nav_map.keys()))
+nav = _nav_map[_nav_choice]
 
-if nav == "Explanation":
-    # --- Dashboard Description ---
-    st.header("What is Cyberbullying?")
-    st.markdown(
-        "Cyberbullying refers to bullying that is done with the use of digital communication platforms with intent harass, threaten, or humiliate individuals (U.S. Department of Health and Human Services, 2021) "
-        "Most commonly done by sending offensive material or participating in social violence over various types of digital media such as forums, social media and messaging applications (Perera & Fernando, 2024) "
-        #--Challenges of cyberbullying
-        "Cyberbullying can be Particularly hard to notice as parents and teachers may not always have access to oversee the platforms at which cyberbullying takes place (U.S. Department of Health and Human Services, 2021)."
-        "The aggression happening online also means the bullies have a sense of invincibility and morally disengage when harassing the victim (Suler, 2004). Additionally, being anonymous allows users to harass others without facing any meaningful consequences (Palomares et al., 2025)."
+if nav == "Info about Cyberbullying":
+    st.title("Information about cyberbullying")
+    st.header("📢What is Cyberbullying?")
+    st.markdown( #🔍📖🧾📲📢⚙️⚔️🔋⌨️💾💡
+        """Cyberbullying refers to bullying that is done with the use of digital communication platforms with intent
+harass, threaten, or humiliate individuals (U.S. Department of Health and Human Services, 2021). 
+Most commonly done by sending offensive material or participating in social violence over various types of
+digital media such as forums, social media and messaging applications (Perera & Fernando, 2024)."""
     )
-
-    st.header("Understanding the Features")
-    st.markdown('''
-        This model uses three additional numerical features to better understand the context of potential cyberbullying:
-
-        *   **Peerness (0.0-1.0):** Peerness is a measure of the relationship between any two users, a higher peerness indicates the users interact with each other more frequently, potentially reducing probability of cyberbullying, ranging from 0.0 to 1.0
-        *   **Aggressiveness (0.0-1.0):** Aggressiveness is a feature that ranges from 0.0 to 1.0 , which is a measure of how aggressive post by a user is, which is measured by taking the ratio of total aggressive messages over the total messages between each pair of users.
-        *   **Repetition (0.0-1.0):** Repetition is a measure from the time and date features to see how frequent posts and replies happens between to users. In the dataset, this is labelled as Average Time Difference between Messages in Seconds (Avg_Time_Diff_Secs)." 
-    ''')
-
-    st.markdown("---")
-    st.header("How This Dashboard Works")
-    st.markdown('''
-        Enter a piece of text that you suspect might contain cyberbullying. Adjust the 'Peerness', 'Aggressiveness', and 'Repetition' sliders to provide additional context. The app will then use a fine-tuned BERT model to predict whether the text, combined with the numerical context, constitutes cyberbullying. The output will be a label ("Not Cyberbullying" or "Cyberbullying") plus a confidence score.
-
-        **Inputs:**
-        1.  **Text:** The message or content to be analyzed.
-        2.  **Peerness:** A numerical value between 0.0 and 1.0.
-        3.  **Aggressiveness:** A numerical value between 0.0 and 1.0.
-        4.  **Repetition:** A numerical value between 0.0 and 1.0.
-
-        **Output:**
-        *   A prediction label indicating whether cyberbullying is detected and the prediction confidence.
-    ''')
+    st.header("⚔️Challenge of Cyberbullying Prevention")
+    st.markdown(
+        """Particularly hard to notice as parents and teachers may not always have access to oversee the
+platforms at which cyberbullying takes place (U.S. Department of Health and Human Services, 2021).
+»The aggression happening online also means the bullies have a sense of invincibility and morally
+disengage when harassing the victim (Suler, 2004). Additionally, being anonymous allows users to
+harass others without facing any meaningful consequences (Palomares et al., 2025)."""
+    )
+    st.header("💡Impact of Cyberbullying")
+    st.markdown(
+        """The effects of cyberbullying can be severe as an individual can feel as if they are being
+attacked anywhere they are, even in their own home(UNICEF, 2025).  
+»Mentally victims can suffer from depression, anxiety and if left untreated this can lead to
+self-harm and suicide. In 2025, the lifetime victimization of cyberbullying victims increased
+from 33.6% in 2016 to 58.2% this year(Sayed et al., 2025). """
+    )
+    
+    # Insert AdvancementSS image
+    st.image("AdvancementSS.png", caption="Advancements in Cyberbullying Detection")
+    
+    st.header("⚙️What is Cyberbullying Detection")
+    st.markdown(
+        """Cyberbullying detection involves using computational techniques, including Natural Language Processing and Machine
+Learning to automatically identify and classify bullying-related content. 
+»These systems aim to improve moderation efficiency and reduce the psychological impact on victims (Sayed et al., 2025).
+»Classification models are supervised machine learning models that divide data into predefined classes and learn the class
+characteristics based on the input data to make predictions (International Business Machines (IBM), 2024)."""
+    )
+    st.header("📲What is Multi-Aspect Cyberbullying ")
+    st.markdown(
+        """Multi-aspect means it cannot be defined by a single action or parameter but rather by a spectrum of aggressive
+behaviors, delivery times, and negativity (Ejaz, Choudhury, et al., 2024). 
+»This is further complicated by the different types of cyberbullying, such as attacking an individual for their age,
+race, religion, sexual orientation and others (Fati et al., 2025).
+»Furthermore, cyberbullying is multi-aspect in terms of the platforms used, as it can occur across various digital
+venues including social media, online games, and messaging apps."""
+    )
+    
+    # Insert SHAPss image
+    st.image("SHAPss.png", caption="SHAP Explainability")
+    
+    st.markdown(
+        """In this project, SHAP is used to interpret the model’s predictions by quantifying how both textual tokens and numerical features contribute to each output. By comparing inputs against a representative background distribution, SHAP explains individual predictions and identifies the most influential features, improving transparency and trust in the deployed model."""
+    )
 
 elif nav == "Dataset":
-    st.header("Dataset Requirements and Explanation")
-    st.markdown("Your CSV must include the following columns: `text`, `peerness`, `aggressiveness`, `repetition`.")
+    st.title("Dataset used to train the model")
     st.markdown(
-        "- `text`: the message to analyze (string).\n"
-        "- `peerness`: float in [0.0, 1.0] representing how peer-like the relationship is.\n"
-        "- `aggressiveness`: float in [0.0, 1.0] indicating how aggressive the content is.\n"
-        "- `repetition`: float in [0.0, 1.0] indicating frequency / repetition of messaging behavior.\n"
+        "The dataset used to train the classifation model is from the baseline paper by Ejaz, Choudhury, et al., 2024. " \
+        "It containts above 9500 rows of cyberbullying texts along with the various numerical features that have been implemented in the classification model. " \
+        "The data contains texts from X from the year 2022 to 2024 containing tweets from and between users. However only the texts and date and time stamps are authentic, while all the other features seen across all the files in tbe dataset are synthetic" \
+        
     )
-    st.markdown("Column names are treated case-insensitively (they will be lowercased). Values outside [0,1] or non-numeric values will be flagged during validation.")
-
-    st.subheader("Example row")
-    example = pd.DataFrame({
-        "text": ["You are so annoying"],
-        "peerness": [0.2],
-        "aggressiveness": [0.8],
-        "repetition": [0.9]
-    })
-    st.dataframe(example)
+    
+    # Display first image above placeholder
+    st.image("MendelyDataSS.png", caption="Mendeley Dataset")
+    
+    st.subheader("Dataset Source")
+    st.markdown(
+        "The dataset is sourced from [Mendeley Data](https://data.mendeley.com/datasets/wmx9jj2htd/2). There are 6 files in total as seen in the image below. " \
+        "However the class labels between Cyberbullying (1) and Not Cyberbullying (0) had a massive imbalance. Hence, data augmetnation was required.  " \
+        "Finally, the numerical features used to train the model; Where peerness can be found in the first file which contains each pair of users along with their peerness rating. Aggressiveness can be found in the last file title CB_Labels where the text between users are shown and labelled as aggressive or not. Repetition is measure from the date and time stamps found in the same CSV. " \
+        "All these features contribute to the multi-aspect nature of cyberbullying detection and are concatenated into one dataset to train the model. "  
+    )
+    
+    # Display second image below placeholder
+    st.image("CSVFilesSS.png", caption="CSV Files")
+    
+    st.subheader("Dataset Snapshot (example)")
+    try:
+        if os.path.exists(BACKGROUND_CSV):
+            df_bg = pd.read_csv(BACKGROUND_CSV)
+            st.dataframe(df_bg.head(10))
+        else:
+            example = pd.DataFrame({
+                "text": ["Sample training message: You are so annoying"],
+                "peerness": [0.3],
+                "aggressiveness": [0.7],
+                "repetition": [0.4]
+            })
+            st.dataframe(example)
+    except Exception as e:
+        st.warning(f"Could not load dataset snapshot: {e}")
+        example = pd.DataFrame({
+            "text": ["Sample training message: You are so annoying"],
+            "peerness": [0.3],
+            "aggressiveness": [0.7],
+            "repetition": [0.4]
+        })
+        st.dataframe(example)
 
 elif nav == "Predict / Upload":
-    st.header("Single Prediction")
-    st.subheader("Enter Text for Analysis")
+    st.title("Cyberbullying Detection Platform")
+    st.markdown(
+        "Multiaspect cyberbullying considers both the message text and contextual numerical features (peerness, aggressiveness, repetition). Use the single prediction form below or upload a CSV for batch predictions."
+    )
+
+    st.header("Case by case prediction")
+    if st.session_state.get('bg_loaded'):
+        st.caption("Numeric SHAP available (using model_augmented_complete.csv background).")
     text = st.text_area("Text to analyze:", height=150)
 
-    # Numerical Inputs
     st.subheader("Adjust Contextual Features")
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -130,13 +337,113 @@ elif nav == "Predict / Upload":
             pred_class = torch.argmax(probs, dim=1).item()
             pred_prob = probs[0, pred_class].item()
 
-            label_map = {0: "Not Cyberbullying", 1: "Cyberbullying"}
-            st.success(f"Prediction: {label_map[pred_class]} (Confidence: {pred_prob*100:.2f}%)")
+            # Persist last prediction in session state so it survives reruns
+            st.session_state['last_prediction'] = {
+                'text': text,
+                'numeric': [peerness, aggressiveness, repetition],
+                'pred_class': int(pred_class),
+                'pred_prob': float(pred_prob),
+                'probs': probs.detach().cpu().numpy(),
+            }
 
-            # Optional: show full probability distribution
-            st.write("Class probabilities:")
-            st.write(f"Not Cyberbullying: {probs[0,0]*100:.2f}%")
-            st.write(f"Cyberbullying: {probs[0,1]*100:.2f}%")
+            label_map = {0: "Not Cyberbullying", 1: "Cyberbullying"}
+            # Prediction will be displayed in the persisted results section below (to avoid duplicate outputs)
+
+
+    # Persisted prediction display (survives reruns) ---------------------------------
+    if st.session_state.get('last_prediction') is not None:
+        pred = st.session_state['last_prediction']
+        label_map = {0: "Not Cyberbullying", 1: "Cyberbullying"}
+        st.success(f"Prediction: {label_map.get(pred['pred_class'], pred['pred_class'])}")
+        st.write("Class probabilities:")
+        probs = pred['probs']
+        try:
+            if probs.shape[1] == 2:
+                st.write(f"Not Cyberbullying: {probs[0,0]*100:.2f}%")
+                st.write(f"Cyberbullying: {probs[0,1]*100:.2f}%")
+            else:
+                st.write(probs)
+        except Exception:
+            st.write(probs)
+
+        # Explain this persisted input
+        if st.button("Explain this input", key="explain_persist"):
+            # Ensure explainer exists (build a lightweight default if not)
+            if st.session_state.get('explainer') is None:
+                with st.spinner("Building default SHAP explainer (this may take a moment)..."):
+                    try:
+                        default_bg = ["I love this!", "You are terrible", "I appreciate your help", "You're an idiot"]
+                        bg_texts = st.session_state.get('bg_texts', default_bg)
+                        bg_numeric = st.session_state.get('bg_numeric', None)
+                        bg_numeric_names = st.session_state.get('bg_numeric_names', None)
+                        st.session_state['explainer'] = HuggingFaceShapExplainer(
+                            MODEL_ID,
+                            background_texts=bg_texts[:200],
+                            background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
+                            numeric_feature_names=bg_numeric_names,
+                        )
+                        # Explainer built silently (no popup).
+                    except Exception as e:
+                        st.error(f"Could not build explainer: {e}")
+            expl = st.session_state.get('explainer')
+            # If a numeric background was auto-loaded after the explainer was built, rebuild explainer to include it
+            if expl is not None and getattr(expl, 'background_numeric', None) is None and st.session_state.get('bg_numeric') is not None:
+                with st.spinner("Updating explainer to include numeric background..."):
+                    try:
+                        default_bg = ["I love this!", "You are terrible", "I appreciate your help", "You're an idiot"]
+                        bg_texts = st.session_state.get('bg_texts', default_bg)
+                        bg_numeric = st.session_state.get('bg_numeric')
+                        bg_numeric_names = st.session_state.get('bg_numeric_names')
+                        st.session_state['explainer'] = HuggingFaceShapExplainer(
+                            MODEL_ID,
+                            background_texts=bg_texts[:200],
+                            background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
+                            numeric_feature_names=bg_numeric_names,
+                        )
+                        expl = st.session_state.get('explainer')
+                        # Explainer updated silently (no popup).
+                    except Exception as e:
+                        st.error(f"Could not update explainer with numeric background: {e}")
+
+            if expl is not None:
+                if getattr(expl, 'background_numeric', None) is not None:
+                    numeric_input = pred['numeric']
+                else:
+                    numeric_input = None
+                    st.info("Numeric SHAP not available: no numeric background provided. Showing token-level SHAP only.")
+
+                try:
+                    with st.spinner("Computing SHAP explanation..."):
+                        run_explain_and_render(expl, pred['text'], numeric=numeric_input, label_map=label_map)
+                except Exception as e:
+                    st.error(f"SHAP explanation failed: {e}")
+
+
+    # Collapsible explanations under the prediction area
+    with st.expander("Feature Explanation"):
+        st.subheader("Understanding the Features")
+        st.markdown('''\
+            This model uses three additional numerical features to better understand the context of potential cyberbullying:
+
+            *   **Peerness (0.0-1.0):** Peerness measures the relationship intensity between users; higher values indicate more frequent interaction.
+            *   **Aggressiveness (0.0-1.0):** Aggressiveness estimates how aggressive a user's messages are (ratio of aggressive messages to total messages).
+            *   **Repetition (0.0-1.0):** Repetition measures the frequency of messaging (e.g., average time difference between messages).
+        ''')
+
+    with st.expander("How This Dashboard Works"):
+        st.subheader("How This Dashboard Works")
+        st.markdown('''\
+            Enter a piece of text that you suspect might contain cyberbullying. Adjust the 'Peerness', 'Aggressiveness', and 'Repetition' sliders to provide additional context. The app uses a fine-tuned BERT model that takes the text plus these numerical features and outputs a label ("Not Cyberbullying" or "Cyberbullying") with a confidence score.
+
+            **Inputs:**
+            1.  **Text:** The message or content to be analyzed.
+            2.  **Peerness:** A numerical value between 0.0 and 1.0.
+            3.  **Aggressiveness:** A numerical value between 0.0 and 1.0.
+            4.  **Repetition:** A numerical value between 0.0 and 1.0.
+
+            **Output:**
+            *   A prediction label indicating whether cyberbullying is detected and the prediction confidence.
+        ''')
 
     st.markdown("---")
     st.header("Batch CSV Upload")
@@ -146,40 +453,38 @@ elif nav == "Predict / Upload":
     if uploaded_file is not None:
         try:
             df = pd.read_csv(uploaded_file)
+            # Normalize column names early
+            df.columns = df.columns.str.lower().str.strip()
+            # Keep a working copy in session_state so user actions (auto-fix / drop) persist across reruns
+            st.session_state['batch_df'] = df.copy()
+            df = st.session_state['batch_df']
         except Exception as e:
             st.error(f"Could not read CSV: {e}")
         else:
-            # Normalize column names
-            df.columns = df.columns.str.lower().str.strip()
-            required = ["text", "peerness", "aggressiveness", "repetition"]
-            missing = [c for c in required if c not in df.columns]
-            if missing:
-                st.error(f"Missing required columns: {missing}")
-            else:
-                # Coerce numerics
-                for col in ["peerness", "aggressiveness", "repetition"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-                # Find invalid rows
-                invalid_mask = (
-                    df[["peerness", "aggressiveness", "repetition"]].isna() |
-                    (df[["peerness", "aggressiveness", "repetition"]] < 0) |
-                    (df[["peerness", "aggressiveness", "repetition"]] > 1)
-                )
-                invalid_rows = df[invalid_mask.any(axis=1)]
-                if not invalid_rows.empty:
-                    st.error("Some rows have invalid numeric features (non-numeric or not in [0,1]). Showing up to 10 examples:")
-                    st.dataframe(invalid_rows.head(10))
+# Use working copy from session_state (may have been modified by 'Auto-fix' or 'Drop invalid rows' actions)
+                df = st.session_state.get('batch_df', df)
+                required = ["text", "peerness", "aggressiveness", "repetition"]
+                missing = [c for c in required if c not in df.columns]
+                if missing:
+                    st.error(f"Missing required columns: {missing}")
                 else:
-                    st.success("CSV looks good. You can preview and run batch prediction below.")
-                    st.subheader("Preview")
-                    st.dataframe(df.head(10))
+                    # Coerce numerics (attempt to convert current values)
+                    for col in ["peerness", "aggressiveness", "repetition"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-                    if st.button("Run Batch Prediction"):
-                        texts = df["text"].astype(str).tolist()
+                    # Find invalid rows
+                    invalid_mask = (
+                        df[["peerness", "aggressiveness", "repetition"]].isna() |
+                        (df[["peerness", "aggressiveness", "repetition"]] < 0) |
+                        (df[["peerness", "aggressiveness", "repetition"]] > 1)
+                    )
+                    invalid_rows = df[invalid_mask.any(axis=1)]
+
+                    def _run_batch_prediction(df_input):
+                        texts = df_input["text"].astype(str).tolist()
                         inputs = tokenizer(texts, return_tensors="pt", truncation=True, padding=True)
 
-                        numerical_features = torch.tensor(df[["peerness", "aggressiveness", "repetition"]].values, dtype=torch.float)
+                        numerical_features = torch.tensor(df_input[["peerness", "aggressiveness", "repetition"]].values, dtype=torch.float)
                         if torch.cuda.is_available():
                             numerical_features = numerical_features.to(model.device)
                             inputs = {k: v.to(model.device) for k, v in inputs.items()}
@@ -198,7 +503,7 @@ elif nav == "Predict / Upload":
                         confs = probs[range(len(preds)), preds].cpu().numpy()
 
                         label_map = {0: "Not Cyberbullying", 1: "Cyberbullying"}
-                        df_result = df.copy()
+                        df_result = df_input.copy()
                         df_result["prediction_label"] = [label_map[int(p)] for p in preds]
                         df_result["confidence"] = (confs * 100).round(2)
 
@@ -207,3 +512,114 @@ elif nav == "Predict / Upload":
 
                         csv_bytes = df_result.to_csv(index=False).encode("utf-8")
                         st.download_button("Download results as CSV", csv_bytes, file_name="predictions.csv")
+
+                        # --- Explain a selected row ---
+                        with st.expander("Explain a row (SHAP)"):
+                            idx = st.number_input("Row index to explain", min_value=0, max_value=max(0, len(df_result)-1), value=0, step=1)
+                            if st.button("Explain selected row", key=f"explain_row_{idx}"):
+                                # Ensure explainer exists
+                                if st.session_state.get('explainer') is None:
+                                    with st.spinner("Building default SHAP explainer (this may take a moment)..."):
+                                        try:
+                                            default_bg = ["I love this!", "You are terrible", "I appreciate your help", "You're an idiot"]
+                                            bg_texts = st.session_state.get('bg_texts', default_bg)
+                                            bg_numeric = st.session_state.get('bg_numeric', None)
+                                            bg_numeric_names = st.session_state.get('bg_numeric_names', None)
+                                            st.session_state['explainer'] = HuggingFaceShapExplainer(
+                                                MODEL_ID,
+                                                background_texts=bg_texts[:200],
+                                                background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
+                                                numeric_feature_names=bg_numeric_names,
+                                            )
+                                            # Explainer built silently (no popup).
+                                        except Exception as e:
+                                            st.error(f"Could not build explainer: {e}")
+
+                                        expl = st.session_state.get('explainer')
+                                        # If background numeric was auto-loaded after explainer built, update explainer
+                                        if expl is not None and getattr(expl, 'background_numeric', None) is None and st.session_state.get('bg_numeric') is not None:
+                                            with st.spinner("Updating explainer to include numeric background..."):
+                                                try:
+                                                    default_bg = ["I love this!", "You are terrible", "I appreciate your help", "You're an idiot"]
+                                                    bg_texts = st.session_state.get('bg_texts', default_bg)
+                                                    bg_numeric = st.session_state.get('bg_numeric')
+                                                    bg_numeric_names = st.session_state.get('bg_numeric_names')
+                                                    st.session_state['explainer'] = HuggingFaceShapExplainer(
+                                                        MODEL_ID,
+                                                        background_texts=bg_texts[:200],
+                                                        background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
+                                                        numeric_feature_names=bg_numeric_names,
+                                                    )
+                                                    expl = st.session_state.get('explainer')
+                                                    # Explainer updated silently (no popup).
+                                                except Exception as e:
+                                                    st.error(f"Could not update explainer with numeric background: {e}")
+
+                                        if expl is not None:
+                                            sel_text = df_result.loc[idx, 'text']
+                                            if getattr(expl, 'background_numeric', None) is not None:
+                                                numeric_input = [
+                                                    float(df_result.loc[idx, 'peerness']),
+                                                    float(df_result.loc[idx, 'aggressiveness']),
+                                                    float(df_result.loc[idx, 'repetition'])
+                                                ]
+                                            else:
+                                                numeric_input = None
+                                                st.info("Numeric SHAP not available: no numeric background provided. Showing token-level SHAP only.")
+
+                                            try:
+                                                with st.spinner("Computing SHAP explanation..."):
+                                                    run_explain_and_render(expl, sel_text, numeric=numeric_input, label_map=label_map)
+                                            except Exception as e:
+                                                st.error(f"SHAP explanation failed: {e}")
+
+                        if st.button("Run Batch Prediction"):
+                            _run_batch_prediction(df)
+                    if not invalid_rows.empty:
+                        st.error("Some rows have invalid numeric features (non-numeric or not in [0,1]). Showing up to 10 examples:")
+                        st.dataframe(invalid_rows.head(10))
+
+                        col1, col2, col3 = st.columns([1,1,1])
+                        with col1:
+                            if st.button("Auto-fix numeric features", key="auto_fix_btn"):
+                                # Attempt to auto-clean numeric columns: remove %, commas, convert, interpret 0-100 as percent
+                                df_work = df.copy()
+                                def clean_series(s):
+                                    s2 = s.astype(str).str.strip().str.replace('%','', regex=False).str.replace(',','', regex=False)
+                                    s_num = pd.to_numeric(s2, errors='coerce')
+                                    mask_percent = (s_num > 1) & (s_num <= 100)
+                                    s_num.loc[mask_percent] = s_num.loc[mask_percent] / 100.0
+                                    s_num = s_num.clip(0.0,1.0)
+                                    return s_num
+                                for c in ["peerness", "aggressiveness", "repetition"]:
+                                    try:
+                                        df_work[c] = clean_series(df_work[c])
+                                    except Exception:
+                                        df_work[c] = pd.to_numeric(df_work[c], errors='coerce')
+
+                                st.session_state['batch_df'] = df_work
+                                if hasattr(st, 'experimental_rerun'):
+                                    st.experimental_rerun()
+                                else:
+                                    st.session_state['batch_ready'] = True
+                                    st.success("Changes applied — preview updated.")
+
+                        with col2:
+                            if st.button("Drop invalid rows", key="drop_invalid_btn"):
+                                df_work = df[~invalid_mask.any(axis=1)].copy()
+                                st.session_state['batch_df'] = df_work
+                                if hasattr(st, 'experimental_rerun'):
+                                    st.experimental_rerun()
+                                else:
+                                    st.session_state['batch_ready'] = True
+                                    st.success("Invalid rows removed — preview updated.")
+
+                        with col3:
+                            st.info("Auto-fix will try to convert percentages and remove commas, then clip to [0,1]. 'Drop invalid rows' removes offending rows.")
+
+                        # If a fix/drop was applied but the page could not auto-rerun, provide a CTA to run predictions
+                        if st.session_state.get('batch_ready'):
+                            st.success("Cleaned dataset is ready for prediction.")
+                            if st.button("Run Batch Prediction on cleaned data", key="run_after_fix"):
+                                _run_batch_prediction(st.session_state.get('batch_df'))
+                                st.session_state['batch_ready'] = False

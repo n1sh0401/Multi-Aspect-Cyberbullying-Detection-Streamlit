@@ -2,21 +2,29 @@ from transformers import BertPreTrainedModel, BertModel
 from torch import nn
 import torch
 
-additional_features_dim = 3
-
 class BertForMultiModalSequenceClassification(BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.bert = BertModel(config)
 
-        self.mlp_hidden_size = 32
+        # multimodal MLP for additional features — use values from config for reproducibility
+        self.additional_features_dim = getattr(config, "additional_features_dim", 3)
+        self.mlp_hidden_size = getattr(config, "mlp_hidden_size", 8)
         self.feature_mlp = nn.Sequential(
-            nn.Linear(additional_features_dim, self.mlp_hidden_size),
+            nn.Linear(self.additional_features_dim, self.mlp_hidden_size),  # e.g. 3 -> 8
             nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(self.mlp_hidden_size, self.mlp_hidden_size),
             nn.ReLU()
         )
+
+        # ensure important metadata is present in the config so it is saved with the model
+        config.additional_features_dim = self.additional_features_dim
+        config.mlp_hidden_size = self.mlp_hidden_size
+        # optional metadata keys may be set externally (e.g. feature names, scaling stats)
+        config.feature_names = getattr(config, "feature_names", None)
+        config.scaling_stats = getattr(config, "scaling_stats", None)
 
         self.pre_classifier = nn.Linear(config.hidden_size, config.hidden_size)
         self.classifier = nn.Linear(
@@ -26,7 +34,7 @@ class BertForMultiModalSequenceClassification(BertPreTrainedModel):
 
         dropout_prob = (
             config.classifier_dropout
-            if config.classifier_dropout is not None
+            if config.classifier_dropout is not None 
             else config.hidden_dropout_prob
         )
         self.dropout = nn.Dropout(dropout_prob)
@@ -53,14 +61,16 @@ class BertForMultiModalSequenceClassification(BertPreTrainedModel):
         pooled_output = self.dropout(pooled_output)
 
         if additional_features is None:
-            additional_features = torch.zeros(
+            # create a zero vector matching the processed MLP output size
+            processed = torch.zeros(
                 pooled_output.size(0),
                 self.mlp_hidden_size,
                 device=pooled_output.device
             )
         else:
             processed = self.feature_mlp(additional_features)
-            pooled_output = torch.cat((pooled_output, processed), dim=1)
+
+        pooled_output = torch.cat((pooled_output, processed), dim=1)
 
         logits = self.classifier(pooled_output)
 
