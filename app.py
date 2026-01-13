@@ -26,8 +26,8 @@ except Exception as e:
     pass
 
 # Model identifier used across the app
-# Using the FocalLoss model (without -New suffix for compatibility)
-MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss"
+# Using the new FocalLoss model with MLP feature processing
+MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss-New"
 
 st.set_page_config(page_title="Cyberbullying Detection Platform", layout="wide")
 
