@@ -5,7 +5,7 @@ from torch import nn
 import numpy as np
 from transformers import AutoTokenizer, AutoConfig
 
-# Import custom model classes from new model module (v2.0)
+# Import custom model classes from new model module
 from model.bert_multimodal import (
     FocalLoss,
     BertForMultiModalSequenceClassification
@@ -16,9 +16,14 @@ from explainers.shap_explainer import HuggingFaceShapExplainer
 from explainers.streamlit_helpers import run_explain_and_render
 import os
 
-# Authenticate with HuggingFace Hub
+# Authenticate with HuggingFace Hub (optional - if token is expired, proceed without authentication)
 from huggingface_hub import login
-login(token="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", add_to_git_credential=False)
+try:
+    login(token="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", add_to_git_credential=False)
+except Exception as e:
+    # Token may be expired or invalid - proceed without authentication
+    # The model may still be accessible if it's public
+    pass
 
 # Model identifier used across the app
 MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss-New"
@@ -99,12 +104,20 @@ st.markdown(
 @st.cache_resource
 def load_model():
     # Use the global MODEL_ID constant so it can be shared with the SHAP explainer
-    # Add your HuggingFace token here for private model access
+    # Try to use token, but proceed without it if expired
     hf_token = "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"
     
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
+    except Exception:
+        # Token may be expired - try without token
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
-    config = AutoConfig.from_pretrained(MODEL_ID, token=hf_token)
+    try:
+        config = AutoConfig.from_pretrained(MODEL_ID, token=hf_token)
+    except Exception:
+        # Token may be expired - try without token
+        config = AutoConfig.from_pretrained(MODEL_ID)
     # Ensure config matches the fine-tuned model architecture
     config.num_labels = 2
     config.additional_features_dim = getattr(config, "additional_features_dim", 3)
@@ -121,6 +134,13 @@ def load_model():
         config=config,
         token=hf_token
     )
+    
+    # If token failed, try without it
+    if model is None:
+        model = BertForMultiModalSequenceClassification.from_pretrained(
+            MODEL_ID,
+            config=config
+        )
 
     model.eval()
     return tokenizer, model
