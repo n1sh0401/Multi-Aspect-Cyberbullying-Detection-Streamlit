@@ -5,7 +5,7 @@ from torch import nn
 import numpy as np
 from transformers import AutoTokenizer, AutoConfig
 
-# Import custom model classes from new model module
+# Import custom model classes from new model module (v2.0)
 from model.bert_multimodal import (
     FocalLoss,
     BertForMultiModalSequenceClassification
