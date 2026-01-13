@@ -14,7 +14,7 @@ import os
 from huggingface_hub import login
 login(token="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", add_to_git_credential=False)
 
-# Model identifier used across the app
+# Model identifier used across the app (old working model)
 MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss"
 
 # --- Define FocalLoss Class ---
