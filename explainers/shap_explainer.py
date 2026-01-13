@@ -126,7 +126,7 @@ class HuggingFaceShapExplainer:
         enc = {k: v.to(self.device) for k, v in enc.items()}
         with torch.no_grad():
             out = self.model(**enc)
-            logits = out.logits
+            logits = out if isinstance(out, torch.Tensor) else out.logits
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
         return probs
 
@@ -185,7 +185,6 @@ class HuggingFaceShapExplainer:
             texts = [str(t) for t in texts]
             enc = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
             enc = {k: v.to(self.device) for k, v in enc.items()}
-            # Ensure numeric has shape (1, M) then repeat to match the number of texts
             numeric_np = np.array(numeric, dtype=float).reshape(1, -1)
             numeric_repeated = np.repeat(numeric_np, len(texts), axis=0)
             numeric_tensor = torch.tensor(numeric_repeated, dtype=torch.float32).to(self.device)
@@ -194,7 +193,7 @@ class HuggingFaceShapExplainer:
                     out = self.model(**enc, additional_features=numeric_tensor)
                 except TypeError:
                     out = self.model(**enc)
-                logits = out.logits
+                logits = out if isinstance(out, torch.Tensor) else out.logits
                 probs = torch.softmax(logits, dim=-1).cpu().numpy()
             return probs
 
@@ -234,7 +233,7 @@ class HuggingFaceShapExplainer:
                     out = self.model(**enc, additional_features=numeric_tensor)
                 except TypeError:
                     out = self.model(**enc)
-                logits = out.logits
+                logits = out if isinstance(out, torch.Tensor) else out.logits
                 probs = torch.softmax(logits, dim=-1).cpu().numpy()
             if probs.shape[1] == 1:
                 pred_prob = float(probs[0, 0])
@@ -290,7 +289,7 @@ class HuggingFaceShapExplainer:
                     except TypeError:
                         # Fallback: model only uses text
                         out = self.model(**enc)
-                    logits = out.logits
+                    logits = out if isinstance(out, torch.Tensor) else out.logits
                     probs = torch.softmax(logits, dim=-1).cpu().numpy()
                 if probs.shape[1] == 1:
                     return probs[:, 0]

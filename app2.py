@@ -3,13 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 import numpy as np
-from transformers import AutoTokenizer, AutoConfig
-
-# Import custom model classes from new model module
-from model.bert_multimodal import (
-    FocalLoss,
-    BertForMultiModalSequenceClassification
-)
+from transformers import AutoTokenizer, AutoConfig, BertPreTrainedModel, BertModel
 
 # SHAP explainer utilities
 from explainers.shap_explainer import HuggingFaceShapExplainer
@@ -21,7 +15,101 @@ from huggingface_hub import login
 login(token="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", add_to_git_credential=False)
 
 # Model identifier used across the app
-MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss-New"
+MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss"
+
+# --- Define FocalLoss Class ---
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', ignore_index=-100):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+
+    def forward(self, inputs, targets):
+        if self.ignore_index >= 0:
+            valid_indices = (targets != self.ignore_index)
+            targets = targets[valid_indices]
+            inputs = inputs[valid_indices]
+            if targets.numel() == 0:
+                return torch.tensor(0.0, device=inputs.device, requires_grad=True)
+
+        BCE_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1 - pt)**self.gamma * BCE_loss
+
+        if self.reduction == 'mean':
+            return F_loss.mean()
+        elif self.reduction == 'sum':
+            return F_loss.sum()
+        else:
+            return F_loss
+
+# --- Define BertForMultiModalSequenceClassification ---
+class BertForMultiModalSequenceClassification(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.bert = BertModel(config)
+
+        self.additional_features_dim = getattr(config, "additional_features_dim", 3)
+
+        self.pre_classifier = nn.Linear(config.hidden_size, config.hidden_size)
+        self.classifier = nn.Linear(config.hidden_size + self.additional_features_dim, config.num_labels)
+
+        dropout_prob = config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
+        self.dropout = nn.Dropout(dropout_prob)
+
+        self.alpha = getattr(config, 'focal_loss_alpha', 0.25)
+        self.gamma = getattr(config, 'focal_loss_gamma', 1.0)
+
+        self.init_weights()
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        additional_features=None,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        bert_output = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_state = bert_output[0]
+        pooled_output = hidden_state[:, 0]
+
+        pooled_output = self.pre_classifier(pooled_output)
+        pooled_output = nn.ReLU()(pooled_output)
+        pooled_output = self.dropout(pooled_output)
+
+        if additional_features is not None:
+            if isinstance(additional_features, list):
+                additional_features = torch.tensor(additional_features, dtype=pooled_output.dtype, device=pooled_output.device)
+            combined_features = torch.cat((pooled_output, additional_features), dim=1)
+        else:
+            dummy_features = torch.zeros((pooled_output.size(0), self.additional_features_dim), device=pooled_output.device)
+            combined_features = torch.cat((pooled_output, dummy_features), dim=1)
+
+        logits = self.classifier(combined_features)
+
+        from transformers.modeling_outputs import SequenceClassifierOutput
+        return SequenceClassifierOutput(logits=logits)
 
 st.set_page_config(page_title="Cyberbullying Detection Platform", layout="wide")
 
@@ -106,15 +194,9 @@ def load_model():
 
     config = AutoConfig.from_pretrained(MODEL_ID, token=hf_token)
     # Ensure config matches the fine-tuned model architecture
-    config.num_labels = 2
     config.additional_features_dim = getattr(config, "additional_features_dim", 3)
-    config.mlp_hidden_size = getattr(config, "mlp_hidden_size", 32)
-    config.numerical_feature_dropout_prob = getattr(config, "numerical_feature_dropout_prob", 0.3)
-    config.text_weight_scale = getattr(config, "text_weight_scale", 1.5)
-    config.focal_loss_alpha = getattr(config, "focal_loss_alpha", 0.6)
-    config.focal_loss_gamma = getattr(config, "focal_loss_gamma", 2.0)
-    config.hidden_dropout_prob = getattr(config, "hidden_dropout_prob", 0.3)
-    config.classifier_dropout = getattr(config, "classifier_dropout", 0.3)
+    config.focal_loss_alpha = getattr(config, "focal_loss_alpha", 0.25)
+    config.focal_loss_gamma = getattr(config, "focal_loss_gamma", 1.0)
 
     model = BertForMultiModalSequenceClassification.from_pretrained(
         MODEL_ID,
@@ -163,7 +245,36 @@ def normalize_features(repetition_raw, peerness_raw, aggressiveness_raw):
     
     return repetition_normalized, peerness_normalized, aggressiveness_normalized
 
-# Model info will be displayed below navigation after the sidebar
+# Display model info in sidebar for verification
+with st.sidebar:
+    st.divider()
+    st.subheader("🔍 Model Info")
+    st.text(f"Model: {MODEL_ID}")
+    try:
+        import os
+        import json
+        from pathlib import Path
+        
+        # Check locally cached model
+        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+        model_dirs = list(cache_dir.glob("*BERT-cyberbullying*"))
+        
+        if model_dirs:
+            model_dir = model_dirs[0]
+            refs_file = model_dir / "refs" / "main"
+            if refs_file.exists():
+                commit = refs_file.read_text().strip()[:8]
+                st.text(f"✅ Status: Loaded")
+                st.text(f"Commit: {commit}")
+                st.text(f"Cached: {model_dir.stat().st_mtime}")
+            else:
+                st.text(f"✅ Status: Loaded")
+        else:
+            st.text(f"✅ Status: Loaded")
+            st.caption("Run once to cache model")
+    except Exception as e:
+        st.text(f"✅ Status: Loaded")
+    st.divider()
 
 # Auto-load SHAP background from training CSV (if available) so numeric SHAP works without a sidebar
 BACKGROUND_CSV = "model_augmented_complete.csv"
@@ -227,12 +338,16 @@ if 'bg_loaded' not in st.session_state:
     except Exception:
         st.session_state['bg_loaded'] = False
 
-# Add pandas for CSV handling
+# Add pandas for CSV handling 🔍📖🧾📲📢⚙️⚔️🔋⌨️💾💡
 import pandas as pd
 
 # Keep a placeholder for the SHAP explainer in session state (built on demand by the Explain buttons)
 if 'explainer' not in st.session_state:
     st.session_state['explainer'] = None
+
+# Note: Sidebar uploader removed — explanations will use a small default text background when the explainer
+# is auto-built from the Explain buttons (numeric SHAP is not available without numeric background data).
+
 
 # --- Left Navigation (Sidebar) ---
 st.sidebar.title("Navigation")
@@ -247,7 +362,7 @@ nav = _nav_map[_nav_choice]
 if nav == "Info about Cyberbullying":
     st.title("Information about cyberbullying")
     st.header("📢What is Cyberbullying?")
-    st.markdown(
+    st.markdown( #🔍📖🧾📲📢⚙️⚔️🔋⌨️💾💡
         """Cyberbullying refers to bullying that is done with the use of digital communication platforms with intent
 harass, threaten, or humiliate individuals (U.S. Department of Health and Human Services, 2021). 
 Most commonly done by sending offensive material or participating in social violence over various types of
@@ -296,8 +411,8 @@ venues including social media, online games, and messaging apps."""
     
     st.markdown(
         """In this project, SHAP (SHapley Additive exPlanations) is applied to improve the interpretability of the deployed machine learning model by explaining individual predictions. SHAP quantifies the contribution of both textual tokens and numerical features
-          by comparing each input against a representative background distribution derived from training-like data. This allows the model's decisions to be decomposed into feature-level 
-          attributions, showing how specific inputs influence the final prediction. By providing both local explanations and overall feature importance, SHAP enhances model transparency, supports debugging, and increases trust in the system's outputs."""
+          by comparing each input against a representative background distribution derived from training-like data. This allows the model’s decisions to be decomposed into feature-level 
+          attributions, showing how specific inputs influence the final prediction. By providing both local explanations and overall feature importance, SHAP enhances model transparency, supports debugging, and increases trust in the system’s outputs."""
     )
 
 elif nav == "Dataset":
@@ -353,6 +468,8 @@ elif nav == "Predict / Upload":
     )
 
     st.header("Case by case prediction")
+    if st.session_state.get('bg_loaded'):
+        st.caption("Numeric SHAP available (using model_augmented_complete.csv background).")
     text = st.text_area("Text to analyze:", height=150)
 
     st.subheader("Adjust Contextual Features")
@@ -387,13 +504,20 @@ elif nav == "Predict / Upload":
                 )
             # --- SOFTMAX & CONFIDENCE --
             import torch.nn.functional as F
-            # outputs is just logits tensor (no labels during inference)
-            logits = outputs if isinstance(outputs, torch.Tensor) else outputs[1]
+            logits = outputs.logits
             probs = F.softmax(logits, dim=1)
-            # Use 0.4 threshold on class 1 probability
-            pred_class = (probs[:, 1] >= 0.4).long().item()
+            # Boost class 1 probability to account for model bias toward class 0
+            boosted_prob = probs[:, 1] * 3.0  # Amplify cyberbullying probability
+            pred_class = (boosted_prob >= 0.5).long().item()
             pred_prob = probs[0, pred_class].item()
             
+            # DEBUG: Show raw values with scaling info
+            rep_raw_scaled = repetition * NORMALIZATION_STATS['time_max']  # Show 0-17.4127 value
+            st.write(f"**DEBUG - Raw Logits:** {logits.detach().cpu().numpy()}")
+            st.write(f"**DEBUG - Probabilities:** {probs.detach().cpu().numpy()}")
+            st.write(f"**DEBUG - Slider Values:** Repetition={repetition:.4f} (→ log-scale: {rep_raw_scaled:.4f}), Peerness={peerness:.4f}, Aggressiveness={aggressiveness:.4f}")
+            st.write(f"**DEBUG - Normalized Features Sent (0-1):** [rep={rep_norm:.4f}, peer={peer_norm:.4f}, agg={agg_norm:.4f}]")
+
             # Persist last prediction in session state so it survives reruns
             st.session_state['last_prediction'] = {
                 'text': text,
@@ -471,16 +595,7 @@ elif nav == "Predict / Upload":
 
                 try:
                     with st.spinner("Computing SHAP explanation..."):
-                        shap_result = expl.explain_instance(pred['text'], numeric=numeric_input)
-                        # Display SHAP prediction info
-                        st.markdown("---")
-                        st.markdown("**SHAP Explanation Results:**")
-                        st.write(f"Prediction: **{label_map.get(shap_result['prediction_class'], shap_result['prediction_class'])}**")
-                        st.write(f"Confidence: {shap_result['prediction_prob']*100:.2f}%")
-                        st.markdown("---")
-                        # Display the figure
-                        if shap_result['figure'] is not None:
-                            st.pyplot(shap_result['figure'])
+                        run_explain_and_render(expl, pred['text'], numeric=numeric_input, label_map=label_map)
                 except Exception as e:
                     st.error(f"SHAP explanation failed: {e}")
 
@@ -527,134 +642,177 @@ elif nav == "Predict / Upload":
         except Exception as e:
             st.error(f"Could not read CSV: {e}")
         else:
-            df = st.session_state.get('batch_df', df)
-            required = ["text", "peerness", "aggressiveness", "repetition"]
-            missing = [c for c in required if c not in df.columns]
-            if missing:
-                st.error(f"Missing required columns: {missing}")
-            else:
-                # Coerce numerics (attempt to convert current values)
-                for col in ["peerness", "aggressiveness", "repetition"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-                # Find invalid rows
-                invalid_mask = (
-                    df[["peerness", "aggressiveness", "repetition"]].isna() |
-                    (df[["peerness", "aggressiveness", "repetition"]] < 0) |
-                    (df[["peerness", "aggressiveness", "repetition"]] > 1)
-                )
-                invalid_rows = df[invalid_mask.any(axis=1)]
-
-                def _run_batch_prediction(df_input):
-                    texts = df_input["text"].astype(str).tolist()
-                    inputs = tokenizer(texts, return_tensors="pt", truncation=True, padding=True)
-                    # Normalize each feature in the batch
-                    norm_features = []
-                    for idx, row in df_input.iterrows():
-                        rep_norm, peer_norm, agg_norm = normalize_features(
-                            row["repetition"], 
-                            row["peerness"], 
-                            row["aggressiveness"]
-                        )
-                        # IMPORTANT: Feature order must match training! Should be [rep, peer, agg]
-                        norm_features.append([rep_norm, peer_norm, agg_norm])
-                    
-                    numerical_features = torch.tensor(norm_features, dtype=torch.float)
-                    if torch.cuda.is_available():
-                        numerical_features = numerical_features.to(model.device)
-                        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-                    with torch.no_grad():
-                        outputs = model(
-                            input_ids=inputs["input_ids"],
-                            attention_mask=inputs["attention_mask"],
-                            additional_features=numerical_features
-                        )
-
-                    import torch.nn.functional as F
-                    # outputs is just logits tensor (no labels during inference)
-                    logits = outputs if isinstance(outputs, torch.Tensor) else outputs[1]
-                    probs = F.softmax(logits, dim=1)
-                    # Use 0.4 threshold on class 1 probability
-                    preds = (probs[:, 1] >= 0.4).long().cpu().numpy()
-                    confs = probs[range(len(preds)), preds].cpu().numpy()
-
-                    label_map = {0: "Not Cyberbullying", 1: "Cyberbullying"}
-                    df_result = df_input.copy()
-                    df_result["prediction_label"] = [label_map[int(p)] for p in preds]
-                    df_result["confidence"] = (confs * 100).round(2)
-
-                    st.subheader("Results")
-                    st.dataframe(df_result.head(50))
-
-                    csv_bytes = df_result.to_csv(index=False).encode("utf-8")
-                    st.download_button("Download results as CSV", csv_bytes, file_name="predictions.csv")
-
-                if not invalid_rows.empty:
-                    st.error("Some rows have invalid numeric features (non-numeric or not in [0,1]). Showing up to 10 examples:")
-                    st.dataframe(invalid_rows.head(10))
-
-                    col1, col2, col3 = st.columns([1,1,1])
-                    with col1:
-                        if st.button("Auto-fix numeric features", key="auto_fix_btn"):
-                            # Attempt to auto-clean numeric columns
-                            df_work = df.copy()
-                            def clean_series(s):
-                                s2 = s.astype(str).str.strip().str.replace('%','', regex=False).str.replace(',','', regex=False)
-                                s_num = pd.to_numeric(s2, errors='coerce')
-                                mask_percent = (s_num > 1) & (s_num <= 100)
-                                s_num.loc[mask_percent] = s_num.loc[mask_percent] / 100.0
-                                s_num = s_num.clip(0.0,1.0)
-                                return s_num
-                            for c in ["peerness", "aggressiveness", "repetition"]:
-                                try:
-                                    df_work[c] = clean_series(df_work[c])
-                                except Exception:
-                                    df_work[c] = pd.to_numeric(df_work[c], errors='coerce')
-
-                            st.session_state['batch_df'] = df_work
-                            st.session_state['batch_ready'] = True
-                            st.success("Changes applied — preview updated.")
-
-                    with col2:
-                        if st.button("Drop invalid rows", key="drop_invalid_btn"):
-                            df_work = df[~invalid_mask.any(axis=1)].copy()
-                            st.session_state['batch_df'] = df_work
-                            st.session_state['batch_ready'] = True
-                            st.success("Invalid rows removed — preview updated.")
-
-                    with col3:
-                        st.info("Auto-fix will try to convert percentages and remove commas, then clip to [0,1].")
-
-                    if st.session_state.get('batch_ready'):
-                        st.success("Cleaned dataset is ready for prediction.")
-                        if st.button("Run Batch Prediction on cleaned data", key="run_after_fix"):
-                            _run_batch_prediction(st.session_state.get('batch_df'))
-                            st.session_state['batch_ready'] = False
-
+# Use working copy from session_state (may have been modified by 'Auto-fix' or 'Drop invalid rows' actions)
+                df = st.session_state.get('batch_df', df)
+                required = ["text", "peerness", "aggressiveness", "repetition"]
+                missing = [c for c in required if c not in df.columns]
+                if missing:
+                    st.error(f"Missing required columns: {missing}")
                 else:
-                    if st.button("Run Batch Prediction"):
-                        _run_batch_prediction(df)
+                    # Coerce numerics (attempt to convert current values)
+                    for col in ["peerness", "aggressiveness", "repetition"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# Display model info and SHAP availability at sidebar bottom
-with st.sidebar:
-    st.divider()
-    try:
-        from pathlib import Path
-        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
-        model_dirs = list(cache_dir.glob("*BERT-cyberbullying*"))
-        if model_dirs:
-            model_dir = model_dirs[0]
-            refs_file = model_dir / "refs" / "main"
-            if refs_file.exists():
-                commit = refs_file.read_text().strip()[:8]
-                st.caption(f"✅ Model: {MODEL_ID} | Commit: {commit}")
-            else:
-                st.caption(f"✅ Model: {MODEL_ID}")
-        else:
-            st.caption(f"✅ Model: {MODEL_ID}")
-    except Exception:
-        st.caption(f"✅ Model: {MODEL_ID}")
-    
-    if st.session_state.get('bg_loaded'):
-        st.caption("Numeric SHAP available (using model_augmented_complete.csv background).")
+                    # Find invalid rows
+                    invalid_mask = (
+                        df[["peerness", "aggressiveness", "repetition"]].isna() |
+                        (df[["peerness", "aggressiveness", "repetition"]] < 0) |
+                        (df[["peerness", "aggressiveness", "repetition"]] > 1)
+                    )
+                    invalid_rows = df[invalid_mask.any(axis=1)]
+
+                    def _run_batch_prediction(df_input):
+                        texts = df_input["text"].astype(str).tolist()
+                        inputs = tokenizer(texts, return_tensors="pt", truncation=True, padding=True)
+                        # Normalize each feature in the batch
+                        norm_features = []
+                        for idx, row in df_input.iterrows():
+                            rep_norm, peer_norm, agg_norm = normalize_features(
+                                row["repetition"], 
+                                row["peerness"], 
+                                row["aggressiveness"]
+                            )
+                            # IMPORTANT: Feature order must match training! Should be [rep, peer, agg]
+                            norm_features.append([rep_norm, peer_norm, agg_norm])
+                        
+                        numerical_features = torch.tensor(norm_features, dtype=torch.float)
+                        if torch.cuda.is_available():
+                            numerical_features = numerical_features.to(model.device)
+                            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+                        with torch.no_grad():
+                            outputs = model(
+                                input_ids=inputs["input_ids"],
+                                attention_mask=inputs["attention_mask"],
+                                additional_features=numerical_features
+                            )
+
+                        import torch.nn.functional as F
+                        logits = outputs.logits
+                        probs = F.softmax(logits, dim=1)
+                        # Boost class 1 probability to account for model bias toward class 0
+                        boosted_prob = probs[:, 1] * 3.0  # Amplify cyberbullying probability
+                        preds = (boosted_prob >= 0.5).long().cpu().numpy()
+                        confs = probs[range(len(preds)), preds].cpu().numpy()
+
+                        label_map = {0: "Not Cyberbullying", 1: "Cyberbullying"}
+                        df_result = df_input.copy()
+                        df_result["prediction_label"] = [label_map[int(p)] for p in preds]
+                        df_result["confidence"] = (confs * 100).round(2)
+
+                        st.subheader("Results")
+                        st.dataframe(df_result.head(50))
+
+                        csv_bytes = df_result.to_csv(index=False).encode("utf-8")
+                        st.download_button("Download results as CSV", csv_bytes, file_name="predictions.csv")
+
+                        # --- Explain a selected row ---
+                        with st.expander("Explain a row (SHAP)"):
+                            idx = st.number_input("Row index to explain", min_value=0, max_value=max(0, len(df_result)-1), value=0, step=1)
+                            if st.button("Explain selected row", key=f"explain_row_{idx}"):
+                                # Ensure explainer exists
+                                if st.session_state.get('explainer') is None:
+                                    with st.spinner("Building default SHAP explainer (this may take a moment)..."):
+                                        try:
+                                            default_bg = ["I love this!", "You are terrible", "I appreciate your help", "You're an idiot"]
+                                            bg_texts = st.session_state.get('bg_texts', default_bg)
+                                            bg_numeric = st.session_state.get('bg_numeric', None)
+                                            bg_numeric_names = st.session_state.get('bg_numeric_names', None)
+                                            st.session_state['explainer'] = HuggingFaceShapExplainer(
+                                                MODEL_ID,
+                                                background_texts=bg_texts[:200],
+                                                background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
+                                                numeric_feature_names=bg_numeric_names,
+                                            )
+                                            # Explainer built silently (no popup).
+                                        except Exception as e:
+                                            st.error(f"Could not build explainer: {e}")
+
+                                        expl = st.session_state.get('explainer')
+                                        # If background numeric was auto-loaded after explainer built, update explainer
+                                        if expl is not None and getattr(expl, 'background_numeric', None) is None and st.session_state.get('bg_numeric') is not None:
+                                            with st.spinner("Updating explainer to include numeric background..."):
+                                                try:
+                                                    default_bg = ["I love this!", "You are terrible", "I appreciate your help", "You're an idiot"]
+                                                    bg_texts = st.session_state.get('bg_texts', default_bg)
+                                                    bg_numeric = st.session_state.get('bg_numeric')
+                                                    bg_numeric_names = st.session_state.get('bg_numeric_names')
+                                                    st.session_state['explainer'] = HuggingFaceShapExplainer(
+                                                        MODEL_ID,
+                                                        background_texts=bg_texts[:200],
+                                                        background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
+                                                        numeric_feature_names=bg_numeric_names,
+                                                    )
+                                                    expl = st.session_state.get('explainer')
+                                                    # Explainer updated silently (no popup).
+                                                except Exception as e:
+                                                    st.error(f"Could not update explainer with numeric background: {e}")
+
+                                        if expl is not None:
+                                            sel_text = df_result.loc[idx, 'text']
+                                            if getattr(expl, 'background_numeric', None) is not None:
+                                                numeric_input = [
+                                                    float(df_result.loc[idx, 'peerness']),
+                                                    float(df_result.loc[idx, 'aggressiveness']),
+                                                    float(df_result.loc[idx, 'repetition'])
+                                                ]
+                                            else:
+                                                numeric_input = None
+                                                st.info("Numeric SHAP not available: no numeric background provided. Showing token-level SHAP only.")
+
+                                            try:
+                                                with st.spinner("Computing SHAP explanation..."):
+                                                    run_explain_and_render(expl, sel_text, numeric=numeric_input, label_map=label_map)
+                                            except Exception as e:
+                                                st.error(f"SHAP explanation failed: {e}")
+
+                        if st.button("Run Batch Prediction"):
+                            _run_batch_prediction(df)
+                    if not invalid_rows.empty:
+                        st.error("Some rows have invalid numeric features (non-numeric or not in [0,1]). Showing up to 10 examples:")
+                        st.dataframe(invalid_rows.head(10))
+
+                        col1, col2, col3 = st.columns([1,1,1])
+                        with col1:
+                            if st.button("Auto-fix numeric features", key="auto_fix_btn"):
+                                # Attempt to auto-clean numeric columns: remove %, commas, convert, interpret 0-100 as percent
+                                df_work = df.copy()
+                                def clean_series(s):
+                                    s2 = s.astype(str).str.strip().str.replace('%','', regex=False).str.replace(',','', regex=False)
+                                    s_num = pd.to_numeric(s2, errors='coerce')
+                                    mask_percent = (s_num > 1) & (s_num <= 100)
+                                    s_num.loc[mask_percent] = s_num.loc[mask_percent] / 100.0
+                                    s_num = s_num.clip(0.0,1.0)
+                                    return s_num
+                                for c in ["peerness", "aggressiveness", "repetition"]:
+                                    try:
+                                        df_work[c] = clean_series(df_work[c])
+                                    except Exception:
+                                        df_work[c] = pd.to_numeric(df_work[c], errors='coerce')
+
+                                st.session_state['batch_df'] = df_work
+                                if hasattr(st, 'experimental_rerun'):
+                                    st.experimental_rerun()
+                                else:
+                                    st.session_state['batch_ready'] = True
+                                    st.success("Changes applied — preview updated.")
+
+                        with col2:
+                            if st.button("Drop invalid rows", key="drop_invalid_btn"):
+                                df_work = df[~invalid_mask.any(axis=1)].copy()
+                                st.session_state['batch_df'] = df_work
+                                if hasattr(st, 'experimental_rerun'):
+                                    st.experimental_rerun()
+                                else:
+                                    st.session_state['batch_ready'] = True
+                                    st.success("Invalid rows removed — preview updated.")
+
+                        with col3:
+                            st.info("Auto-fix will try to convert percentages and remove commas, then clip to [0,1]. 'Drop invalid rows' removes offending rows.")
+
+                        # If a fix/drop was applied but the page could not auto-rerun, provide a CTA to run predictions
+                        if st.session_state.get('batch_ready'):
+                            st.success("Cleaned dataset is ready for prediction.")
+                            if st.button("Run Batch Prediction on cleaned data", key="run_after_fix"):
+                                _run_batch_prediction(st.session_state.get('batch_df'))
+                                st.session_state['batch_ready'] = False
