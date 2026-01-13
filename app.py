@@ -12,7 +12,7 @@ import os
 
 # Authenticate with HuggingFace Hub
 from huggingface_hub import login
-login(token="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", add_to_git_credential=False)
+login(token="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", add_to_git_credential=False)
 
 # Model identifier used across the app (old working model)
 MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss"
@@ -188,7 +188,7 @@ st.markdown(
 def load_model():
     # Use the global MODEL_ID constant so it can be shared with the SHAP explainer
     # Add your HuggingFace token here for private model access
-    hf_token = "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"
+    hf_token = "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"
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
 
