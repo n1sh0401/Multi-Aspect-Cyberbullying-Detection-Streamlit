@@ -26,7 +26,8 @@ except Exception as e:
     pass
 
 # Model identifier used across the app
-MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss-New"
+# Using the FocalLoss model (without -New suffix for compatibility)
+MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss"
 
 st.set_page_config(page_title="Cyberbullying Detection Platform", layout="wide")
 
@@ -111,13 +112,22 @@ def load_model():
         tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
     except Exception:
         # Token may be expired - try without token
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        except Exception as e:
+            st.error(f"Failed to load tokenizer: {str(e)}")
+            raise
 
     try:
         config = AutoConfig.from_pretrained(MODEL_ID, token=hf_token)
     except Exception:
         # Token may be expired - try without token
-        config = AutoConfig.from_pretrained(MODEL_ID)
+        try:
+            config = AutoConfig.from_pretrained(MODEL_ID)
+        except Exception as e:
+            st.error(f"Failed to load config: {str(e)}")
+            raise
+    
     # Ensure config matches the fine-tuned model architecture
     config.num_labels = 2
     config.additional_features_dim = getattr(config, "additional_features_dim", 3)
@@ -129,18 +139,22 @@ def load_model():
     config.hidden_dropout_prob = getattr(config, "hidden_dropout_prob", 0.3)
     config.classifier_dropout = getattr(config, "classifier_dropout", 0.3)
 
-    model = BertForMultiModalSequenceClassification.from_pretrained(
-        MODEL_ID,
-        config=config,
-        token=hf_token
-    )
-    
-    # If token failed, try without it
-    if model is None:
+    try:
         model = BertForMultiModalSequenceClassification.from_pretrained(
             MODEL_ID,
-            config=config
+            config=config,
+            token=hf_token
         )
+    except Exception:
+        # Token may be expired - try without token
+        try:
+            model = BertForMultiModalSequenceClassification.from_pretrained(
+                MODEL_ID,
+                config=config
+            )
+        except Exception as e:
+            st.error(f"Failed to load model from {MODEL_ID}: {str(e)}\n\nMake sure the model repository is public or you have a valid authentication token.")
+            raise
 
     model.eval()
     return tokenizer, model
