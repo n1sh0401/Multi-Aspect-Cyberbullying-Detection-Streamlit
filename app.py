@@ -143,14 +143,16 @@ def load_model():
         model = BertForMultiModalSequenceClassification.from_pretrained(
             MODEL_ID,
             config=config,
-            token=hf_token
+            token=hf_token,
+            ignore_mismatched_sizes=True
         )
     except Exception:
         # Token may be expired - try without token
         try:
             model = BertForMultiModalSequenceClassification.from_pretrained(
                 MODEL_ID,
-                config=config
+                config=config,
+                ignore_mismatched_sizes=True
             )
         except Exception as e:
             st.error(f"Failed to load model from {MODEL_ID}: {str(e)}\n\nMake sure the model repository is public or you have a valid authentication token.")
