@@ -20,19 +20,22 @@ from explainers.streamlit_helpers import run_explain_and_render
 # Authenticate with HuggingFace Hub
 from huggingface_hub import login
 
-# Get HF token from environment or Streamlit secrets
-hf_token = os.getenv("HF_TOKEN")
+# Get HF token from Streamlit secrets first (for cloud), then environment (for local)
+hf_token = None
+try:
+    hf_token = st.secrets.get("HF_TOKEN")
+except Exception:
+    pass
+
 if not hf_token:
-    try:
-        hf_token = st.secrets.get("HF_TOKEN")
-    except Exception:
-        pass
+    hf_token = os.getenv("HF_TOKEN")
 
 if hf_token:
     try:
         login(token=hf_token, add_to_git_credential=False)
     except Exception as e:
         # Token may be invalid, but we'll still try to load the model with the token parameter
+        pass
         pass
 
 # Model identifier used across the app (old working model)
@@ -208,13 +211,15 @@ st.markdown(
 @st.cache_resource
 def load_model():
     # Use the global MODEL_ID constant so it can be shared with the SHAP explainer
-    # Get token from environment variable or Streamlit secrets
-    hf_token = os.getenv("HF_TOKEN")
+    # Get token from Streamlit secrets first (for cloud), then environment (for local)
+    hf_token = None
+    try:
+        hf_token = st.secrets.get("HF_TOKEN")
+    except Exception:
+        pass
+    
     if not hf_token:
-        try:
-            hf_token = st.secrets.get("HF_TOKEN")
-        except Exception:
-            pass
+        hf_token = os.getenv("HF_TOKEN")
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
 
