@@ -17,9 +17,6 @@ except Exception:
 from explainers.shap_explainer import HuggingFaceShapExplainer
 from explainers.streamlit_helpers import run_explain_and_render
 
-# Authenticate with HuggingFace Hub
-from huggingface_hub import login
-
 # Get HF token from Streamlit secrets first (for cloud), then environment (for local)
 hf_token = None
 try:
@@ -29,17 +26,10 @@ except Exception:
 
 if not hf_token:
     hf_token = os.getenv("HF_TOKEN")
-    # Clear the environment variable to avoid duplicate login messages
-    if hf_token:
-        os.environ.pop("HF_TOKEN", None)
 
-if hf_token:
-    try:
-        login(token=hf_token, add_to_git_credential=False)
-    except Exception as e:
-        # Token may be invalid, but we'll still try to load the model with the token parameter
-        pass
-        pass
+# Clear the environment variable to avoid HuggingFace warnings
+# (we pass token directly to from_pretrained, don't need env var)
+os.environ.pop("HF_TOKEN", None)
 
 # Model identifier used across the app (old working model)
 MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss"
