@@ -6,9 +6,12 @@ import numpy as np
 from transformers import AutoTokenizer, AutoConfig, BertPreTrainedModel, BertModel
 import os
 
-# Load environment variables from secret.env
-from dotenv import load_dotenv
-load_dotenv('secret.env')
+# Load environment variables from secret.env for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv('secret.env')
+except Exception:
+    pass
 
 # SHAP explainer utilities
 from explainers.shap_explainer import HuggingFaceShapExplainer
@@ -16,7 +19,15 @@ from explainers.streamlit_helpers import run_explain_and_render
 
 # Authenticate with HuggingFace Hub
 from huggingface_hub import login
+
+# Get HF token from environment or Streamlit secrets
 hf_token = os.getenv("HF_TOKEN")
+if not hf_token:
+    try:
+        hf_token = st.secrets.get("HF_TOKEN")
+    except Exception:
+        pass
+
 if hf_token:
     try:
         login(token=hf_token, add_to_git_credential=False)
@@ -197,8 +208,13 @@ st.markdown(
 @st.cache_resource
 def load_model():
     # Use the global MODEL_ID constant so it can be shared with the SHAP explainer
-    # Get token from environment variable for security
+    # Get token from environment variable or Streamlit secrets
     hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        try:
+            hf_token = st.secrets.get("HF_TOKEN")
+        except Exception:
+            pass
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
 
@@ -565,6 +581,11 @@ elif nav == "Predict / Upload":
                         bg_numeric = st.session_state.get('bg_numeric', None)
                         bg_numeric_names = st.session_state.get('bg_numeric_names', None)
                         hf_token = os.getenv("HF_TOKEN")
+                        if not hf_token:
+                            try:
+                                hf_token = st.secrets.get("HF_TOKEN")
+                            except Exception:
+                                pass
                         st.session_state['explainer'] = HuggingFaceShapExplainer(
                             MODEL_ID,
                             background_texts=bg_texts[:200],
@@ -585,6 +606,11 @@ elif nav == "Predict / Upload":
                         bg_numeric = st.session_state.get('bg_numeric')
                         bg_numeric_names = st.session_state.get('bg_numeric_names')
                         hf_token = os.getenv("HF_TOKEN")
+                        if not hf_token:
+                            try:
+                                hf_token = st.secrets.get("HF_TOKEN")
+                            except Exception:
+                                pass
                         st.session_state['explainer'] = HuggingFaceShapExplainer(
                             MODEL_ID,
                             background_texts=bg_texts[:200],
@@ -730,6 +756,11 @@ elif nav == "Predict / Upload":
                                             bg_numeric = st.session_state.get('bg_numeric', None)
                                             bg_numeric_names = st.session_state.get('bg_numeric_names', None)
                                             hf_token = os.getenv("HF_TOKEN")
+                                            if not hf_token:
+                                                try:
+                                                    hf_token = st.secrets.get("HF_TOKEN")
+                                                except Exception:
+                                                    pass
                                             st.session_state['explainer'] = HuggingFaceShapExplainer(
                                                 MODEL_ID,
                                                 background_texts=bg_texts[:200],
@@ -751,6 +782,11 @@ elif nav == "Predict / Upload":
                                                     bg_numeric = st.session_state.get('bg_numeric')
                                                     bg_numeric_names = st.session_state.get('bg_numeric_names')
                                                     hf_token = os.getenv("HF_TOKEN")
+                                                    if not hf_token:
+                                                        try:
+                                                            hf_token = st.secrets.get("HF_TOKEN")
+                                                        except Exception:
+                                                            pass
                                                     st.session_state['explainer'] = HuggingFaceShapExplainer(
                                                         MODEL_ID,
                                                         background_texts=bg_texts[:200],
