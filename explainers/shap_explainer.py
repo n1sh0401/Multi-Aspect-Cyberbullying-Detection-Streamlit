@@ -70,8 +70,11 @@ class HuggingFaceShapExplainer:
             self._maybe_build_text_explainer()
 
     def _load_tokenizer_and_model(self):
+        # Extract token from load_model_args if provided
+        token = self.load_model_args.get('token', None) if self.load_model_args else None
+        
         # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, token=token)
 
         # Try loading auto classification model; if it fails, try local custom class
         try:
@@ -80,7 +83,7 @@ class HuggingFaceShapExplainer:
             # Attempt to load with local class name (BertForMultiModalSequenceClassification)
             # This requires the local class in the import path (as in this repo).
             from model.bert_multimodal import BertForMultiModalSequenceClassification
-            config = AutoConfig.from_pretrained(self.model_id)
+            config = AutoConfig.from_pretrained(self.model_id, token=token)
             try:
                 # Try normal load first
                 self.model = BertForMultiModalSequenceClassification.from_pretrained(self.model_id, config=config, **self.load_model_args)

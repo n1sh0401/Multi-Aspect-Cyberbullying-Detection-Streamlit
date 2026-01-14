@@ -4,15 +4,25 @@ import torch.nn.functional as F
 from torch import nn
 import numpy as np
 from transformers import AutoTokenizer, AutoConfig, BertPreTrainedModel, BertModel
+import os
+
+# Load environment variables from secret.env
+from dotenv import load_dotenv
+load_dotenv('secret.env')
 
 # SHAP explainer utilities
 from explainers.shap_explainer import HuggingFaceShapExplainer
 from explainers.streamlit_helpers import run_explain_and_render
-import os
 
 # Authenticate with HuggingFace Hub
 from huggingface_hub import login
-login(token="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", add_to_git_credential=False)
+hf_token = os.getenv("HF_TOKEN")
+if hf_token:
+    try:
+        login(token=hf_token, add_to_git_credential=False)
+    except Exception as e:
+        # Token may be invalid, but we'll still try to load the model with the token parameter
+        pass
 
 # Model identifier used across the app (old working model)
 MODEL_ID = "rngrye/BERT-cyberbullying-classifier-FocalLoss"
@@ -187,8 +197,8 @@ st.markdown(
 @st.cache_resource
 def load_model():
     # Use the global MODEL_ID constant so it can be shared with the SHAP explainer
-    # Add your HuggingFace token here for private model access
-    hf_token = "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"
+    # Get token from environment variable for security
+    hf_token = os.getenv("HF_TOKEN")
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
 
@@ -244,37 +254,6 @@ def normalize_features(repetition_raw, peerness_raw, aggressiveness_raw):
     aggressiveness_normalized = np.clip(aggressiveness_normalized, 0, 1)
     
     return repetition_normalized, peerness_normalized, aggressiveness_normalized
-
-# Display model info in sidebar for verification
-with st.sidebar:
-    st.divider()
-    st.subheader("🔍 Model Info")
-    st.text(f"Model: {MODEL_ID}")
-    try:
-        import os
-        import json
-        from pathlib import Path
-        
-        # Check locally cached model
-        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
-        model_dirs = list(cache_dir.glob("*BERT-cyberbullying*"))
-        
-        if model_dirs:
-            model_dir = model_dirs[0]
-            refs_file = model_dir / "refs" / "main"
-            if refs_file.exists():
-                commit = refs_file.read_text().strip()[:8]
-                st.text(f"✅ Status: Loaded")
-                st.text(f"Commit: {commit}")
-                st.text(f"Cached: {model_dir.stat().st_mtime}")
-            else:
-                st.text(f"✅ Status: Loaded")
-        else:
-            st.text(f"✅ Status: Loaded")
-            st.caption("Run once to cache model")
-    except Exception as e:
-        st.text(f"✅ Status: Loaded")
-    st.divider()
 
 # Auto-load SHAP background from training CSV (if available) so numeric SHAP works without a sidebar
 BACKGROUND_CSV = "model_augmented_complete.csv"
@@ -358,6 +337,34 @@ _nav_map = {
 }
 _nav_choice = st.sidebar.radio("Go to", list(_nav_map.keys()))
 nav = _nav_map[_nav_choice]
+
+# Display model info at the bottom of the sidebar with small font
+with st.sidebar:
+    st.divider()
+    st.caption("🔍 Model Info")
+    st.caption(f"Model: {MODEL_ID}")
+    try:
+        from pathlib import Path
+        
+        # Check locally cached model
+        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+        model_dirs = list(cache_dir.glob("*BERT-cyberbullying*"))
+        
+        if model_dirs:
+            model_dir = model_dirs[0]
+            refs_file = model_dir / "refs" / "main"
+            if refs_file.exists():
+                commit = refs_file.read_text().strip()[:8]
+                st.caption(f"✅ Status: Loaded")
+                st.caption(f"Commit: {commit}")
+            else:
+                st.caption(f"✅ Status: Loaded")
+        else:
+            st.caption(f"✅ Status: Loaded")
+            st.caption("Run once to cache model")
+    except Exception as e:
+        st.caption(f"✅ Status: Loaded")
+    st.divider()
 
 if nav == "Info about Cyberbullying":
     st.title("Information about cyberbullying")
@@ -513,10 +520,10 @@ elif nav == "Predict / Upload":
             
             # DEBUG: Show raw values with scaling info
             rep_raw_scaled = repetition * NORMALIZATION_STATS['time_max']  # Show 0-17.4127 value
-            st.write(f"**DEBUG - Raw Logits:** {logits.detach().cpu().numpy()}")
-            st.write(f"**DEBUG - Probabilities:** {probs.detach().cpu().numpy()}")
-            st.write(f"**DEBUG - Slider Values:** Repetition={repetition:.4f} (→ log-scale: {rep_raw_scaled:.4f}), Peerness={peerness:.4f}, Aggressiveness={aggressiveness:.4f}")
-            st.write(f"**DEBUG - Normalized Features Sent (0-1):** [rep={rep_norm:.4f}, peer={peer_norm:.4f}, agg={agg_norm:.4f}]")
+            # st.write(f"**DEBUG - Raw Logits:** {logits.detach().cpu().numpy()}")
+            # st.write(f"**DEBUG - Probabilities:** {probs.detach().cpu().numpy()}")
+            # st.write(f"**DEBUG - Slider Values:** Repetition={repetition:.4f} (→ log-scale: {rep_raw_scaled:.4f}), Peerness={peerness:.4f}, Aggressiveness={aggressiveness:.4f}")
+            # st.write(f"**DEBUG - Normalized Features Sent (0-1):** [rep={rep_norm:.4f}, peer={peer_norm:.4f}, agg={agg_norm:.4f}]")
 
             # Persist last prediction in session state so it survives reruns
             st.session_state['last_prediction'] = {
@@ -557,11 +564,13 @@ elif nav == "Predict / Upload":
                         bg_texts = st.session_state.get('bg_texts', default_bg)
                         bg_numeric = st.session_state.get('bg_numeric', None)
                         bg_numeric_names = st.session_state.get('bg_numeric_names', None)
+                        hf_token = os.getenv("HF_TOKEN")
                         st.session_state['explainer'] = HuggingFaceShapExplainer(
                             MODEL_ID,
                             background_texts=bg_texts[:200],
                             background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
                             numeric_feature_names=bg_numeric_names,
+                            load_model_args={"token": hf_token} if hf_token else {},
                         )
                         # Explainer built silently (no popup).
                     except Exception as e:
@@ -575,11 +584,13 @@ elif nav == "Predict / Upload":
                         bg_texts = st.session_state.get('bg_texts', default_bg)
                         bg_numeric = st.session_state.get('bg_numeric')
                         bg_numeric_names = st.session_state.get('bg_numeric_names')
+                        hf_token = os.getenv("HF_TOKEN")
                         st.session_state['explainer'] = HuggingFaceShapExplainer(
                             MODEL_ID,
                             background_texts=bg_texts[:200],
                             background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
                             numeric_feature_names=bg_numeric_names,
+                            load_model_args={"token": hf_token} if hf_token else {},
                         )
                         expl = st.session_state.get('explainer')
                         # Explainer updated silently (no popup).
@@ -718,11 +729,13 @@ elif nav == "Predict / Upload":
                                             bg_texts = st.session_state.get('bg_texts', default_bg)
                                             bg_numeric = st.session_state.get('bg_numeric', None)
                                             bg_numeric_names = st.session_state.get('bg_numeric_names', None)
+                                            hf_token = os.getenv("HF_TOKEN")
                                             st.session_state['explainer'] = HuggingFaceShapExplainer(
                                                 MODEL_ID,
                                                 background_texts=bg_texts[:200],
                                                 background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
                                                 numeric_feature_names=bg_numeric_names,
+                                                load_model_args={"token": hf_token} if hf_token else {},
                                             )
                                             # Explainer built silently (no popup).
                                         except Exception as e:
@@ -737,11 +750,13 @@ elif nav == "Predict / Upload":
                                                     bg_texts = st.session_state.get('bg_texts', default_bg)
                                                     bg_numeric = st.session_state.get('bg_numeric')
                                                     bg_numeric_names = st.session_state.get('bg_numeric_names')
+                                                    hf_token = os.getenv("HF_TOKEN")
                                                     st.session_state['explainer'] = HuggingFaceShapExplainer(
                                                         MODEL_ID,
                                                         background_texts=bg_texts[:200],
                                                         background_numeric=(bg_numeric[:200] if bg_numeric is not None else None),
                                                         numeric_feature_names=bg_numeric_names,
+                                                        load_model_args={"token": hf_token} if hf_token else {},
                                                     )
                                                     expl = st.session_state.get('explainer')
                                                     # Explainer updated silently (no popup).
