@@ -224,8 +224,9 @@ def load_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
 
     config = AutoConfig.from_pretrained(MODEL_ID, token=hf_token)
-    # Ensure config matches the fine-tuned model architecture
-    config.additional_features_dim = getattr(config, "additional_features_dim", 3)
+    # Ensure config matches the fine-tuned model architecture (old version with 3 raw features, no MLP)
+    config.additional_features_dim = 3
+    config.mlp_hidden_size = 3  # No MLP processing - use raw 3 features directly
     config.focal_loss_alpha = getattr(config, "focal_loss_alpha", 0.25)
     config.focal_loss_gamma = getattr(config, "focal_loss_gamma", 1.0)
 

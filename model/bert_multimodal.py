@@ -10,14 +10,22 @@ class BertForMultiModalSequenceClassification(BertPreTrainedModel):
 
         # multimodal MLP for additional features — use values from config for reproducibility
         self.additional_features_dim = getattr(config, "additional_features_dim", 3)
-        self.mlp_hidden_size = getattr(config, "mlp_hidden_size", 8)
-        self.feature_mlp = nn.Sequential(
-            nn.Linear(self.additional_features_dim, self.mlp_hidden_size),  # e.g. 3 -> 8
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(self.mlp_hidden_size, self.mlp_hidden_size),
-            nn.ReLU()
-        )
+        self.mlp_hidden_size = getattr(config, "mlp_hidden_size", 3)
+        
+        # Only create MLP if hidden size differs from input size (for old checkpoint compatibility)
+        if self.mlp_hidden_size != self.additional_features_dim:
+            self.feature_mlp = nn.Sequential(
+                nn.Linear(self.additional_features_dim, self.mlp_hidden_size),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(self.mlp_hidden_size, self.mlp_hidden_size),
+                nn.ReLU()
+            )
+        else:
+            self.feature_mlp = None  # No MLP, pass through raw features
+        
+        # Determine final feature dimension after MLP (or raw if no MLP)
+        final_feature_dim = self.mlp_hidden_size
 
         # ensure important metadata is present in the config so it is saved with the model
         config.additional_features_dim = self.additional_features_dim
@@ -28,7 +36,7 @@ class BertForMultiModalSequenceClassification(BertPreTrainedModel):
 
         self.pre_classifier = nn.Linear(config.hidden_size, config.hidden_size)
         self.classifier = nn.Linear(
-            config.hidden_size + self.mlp_hidden_size,
+            config.hidden_size + final_feature_dim,
             config.num_labels
         )
 
@@ -61,14 +69,17 @@ class BertForMultiModalSequenceClassification(BertPreTrainedModel):
         pooled_output = self.dropout(pooled_output)
 
         if additional_features is None:
-            # create a zero vector matching the processed MLP output size
+            # create a zero vector matching the processed feature output size
             processed = torch.zeros(
                 pooled_output.size(0),
                 self.mlp_hidden_size,
                 device=pooled_output.device
             )
         else:
-            processed = self.feature_mlp(additional_features)
+            if self.feature_mlp is not None:
+                processed = self.feature_mlp(additional_features)
+            else:
+                processed = additional_features  # Pass through raw features if no MLP
 
         pooled_output = torch.cat((pooled_output, processed), dim=1)
 
