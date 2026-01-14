@@ -29,6 +29,9 @@ except Exception:
 
 if not hf_token:
     hf_token = os.getenv("HF_TOKEN")
+    # Clear the environment variable to avoid duplicate login messages
+    if hf_token:
+        os.environ.pop("HF_TOKEN", None)
 
 if hf_token:
     try:
